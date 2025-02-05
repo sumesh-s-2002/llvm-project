@@ -190,6 +190,16 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
   getActionDefinitionsBuilder(
       {G_BUILD_VECTOR, G_SHUFFLE_VECTOR, G_SPLAT_VECTOR})
       .alwaysLegal();
+ 
+  //fp_class lefalization
+  getActionDefinitionsBuilder(G_IS_FPCLASS)
+    .legalIf([=](const LegalityQuery &Query) {
+        const LLT Ty = Query.Types[1];
+        return (Ty == s32 || Ty == s64) && 
+         Query.Types[0].getScalarSizeInBits() == 1;
+    });
+
+    
 
   // Vector Reduction Operations
   getActionDefinitionsBuilder(
