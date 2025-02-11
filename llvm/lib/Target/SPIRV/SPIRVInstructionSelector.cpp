@@ -15,6 +15,7 @@
 #include "MCTargetDesc/SPIRVBaseInfo.h"
 #include "MCTargetDesc/SPIRVMCTargetDesc.h"
 #include "SPIRV.h"
+#include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
 #include "SPIRVGlobalRegistry.h"
 #include "SPIRVInstrInfo.h"
 #include "SPIRVRegisterBankInfo.h"
@@ -532,6 +533,7 @@ bool SPIRVInstructionSelector::BuildCOPY(Register DestReg, Register SrcReg,
 bool SPIRVInstructionSelector::spvSelect(Register ResVReg,
                                          const SPIRVType *ResType,
                                          MachineInstr &I) const {
+
   const unsigned Opcode = I.getOpcode();
   if (mayApplyGenericSelection(Opcode))
     return selectImpl(I, *CoverageInfo);
@@ -893,10 +895,8 @@ bool SPIRVInstructionSelector::spvSelect(Register ResVReg,
   case TargetOpcode::G_UBSANTRAP:
   case TargetOpcode::DBG_LABEL:
     return true;
-  case TargetOpcode::G_IS_FPCLASS: {
-    return selectIsFpclass(ResVReg, ResType, I);
-  }
-
+  case TargetOpcode::G_IS_FPCLASS:
+    return selectIsFpclass(ResVReg,ResType,I);
   default:
     return false;
   }
@@ -3846,23 +3846,91 @@ bool SPIRVInstructionSelector::selectGlobalValue(
 //     return 0; 
 // }
 
+
+llvm::Type* getLLVMType(LLT srcLLTType, llvm::LLVMContext &context) {
+    if (srcLLTType.isScalar()) {
+        switch (srcLLTType.getSizeInBits()) {
+            case 32: return llvm::Type::getFloatTy(context);  // float
+            case 64: return llvm::Type::getDoubleTy(context); // double
+            default:
+                llvm_unreachable("Unsupported scalar floating-point type!");
+        }
+    } else if (srcLLTType.isVector()) {
+        unsigned numElements = srcLLTType.getNumElements();
+        LLT elemType = srcLLTType.getElementType();
+
+        if (elemType.isScalar()) {
+            llvm::Type* baseType = nullptr;
+            switch (elemType.getSizeInBits()) {
+                case 32: baseType = llvm::Type::getFloatTy(context); break;
+                case 64: baseType = llvm::Type::getDoubleTy(context); break;
+                default:
+                    llvm_unreachable("Unsupported vector element type!");
+            }
+            return llvm::VectorType::get(baseType, llvm::ElementCount::getFixed(numElements));
+        }
+    }
+
+    llvm_unreachable("Unsupported LLT type conversion!");
+}
+
+int getBitWidth(LLT srcLLTType){
+  int bitWidth;
+  if(srcLLTType.isScalar()){
+    bitWidth = srcLLTType.getSizeInBits();
+  }else if(srcLLTType.isVector()){
+    bitWidth = srcLLTType.getElementType().getSizeInBits();
+  }
+  return bitWidth;
+}
+
+
 bool SPIRVInstructionSelector::selectIsFpclass(Register ResVReg, const SPIRVType *ResType, MachineInstr &I) const {
     MachineIRBuilder MIRBuilder(I);
     //spivType creation for Creating Intermediate Registers
-    SPIRVType* boolType = GR.getOrCreateSPIRVBoolType(MIRBuilder);
+    std::vector<Register> ResultVec;
     Register srcReg = I.getOperand(1).getReg();  
     SPIRVType* srcSPIRVType = GR.getSPIRVTypeForVReg(srcReg);
-    int bitWidth = srcSPIRVType->getOperand(1).getImm();
+    LLT srcLLTType = GR.getRegType(srcSPIRVType);
+    Type* srcLLVMTyp = getLLVMType(srcLLTType, GR.CurMF->getFunction().getContext());
+    int bitWidth = getBitWidth(srcLLTType);
+
+    SPIRVType* IntType = GR.getOrCreateSPIRVType(bitWidth, I, TII, SPIRV::OpTypeInt, IntOpLLVMTy);
+    SPIRVType* boolType = GR.getOrCreateSPIRVBoolType(MIRBuilder);
+    
+    
+    Type *IntOpLLVMTy = IntegerType::getIntNTy(GR.CurMF->getFunction().getContext(),bitWidth);
+    
     Type* srcLLVMType;
     //checking src type to create llvm Type Creation
     srcLLVMType = (bitWidth == 32) ? Type::getFloatTy(GR.CurMF->getFunction().getContext()) : Type::getDoubleTy(GR.CurMF->getFunction().getContext()); 
     llvm::FPClassTest FPClass = static_cast<llvm::FPClassTest>(I.getOperand(2).getImm());
+    llvm::errs() << FPClass << "\n";
 
     //edge cases
     if (FPClass == 0)
       return false;
     if (FPClass == fcAllFlags)
       return true;
+
+
+    //Instruction Template
+    auto instructionTemplate = [&](unsigned Opcode, SPIRVType* DestType, SPIRVType* ReturnType, StringRef Name, auto&&... args) -> Register {
+      Register result = MRI->createVirtualRegister(GR.getRegClass(DestType), Name);
+      auto &Instr = MIRBuilder.buildInstr(Opcode)
+                      .addDef(result)
+                      .addUse(GR.getSPIRVTypeID(DestType));
+
+      ([&](auto&& arg) __attribute__((optimize("O0"))) {
+          if(std::is_integral_v<std::decay_t<decltype(arg)>>) {
+              Instr.addImm(arg);
+          } else {
+              Instr.addUse(arg);
+          }
+      }(args), ...);
+      return result;
+    };
+
     
     //function to check if the sign bit is set or not
     //1 sign is set if 0 sign is not set
@@ -3871,25 +3939,43 @@ bool SPIRVInstructionSelector::selectIsFpclass(Register ResVReg, const SPIRVType
     //--------positive cases -------------//
     // inf && ~sign - positive Infinity
     // inf &&  ~sign - not positive Infinity
-    Register signTest = NULL;
-    auto buildSignCheck = [&]{
-      signTest = MRI->createVirtualRegister(MRI->getRegClass(srcReg));
-      MIRBuilder.buildInstr(SPIRV::OpSignBitSet)
-                .addDef(signTest)
-                .addUse(srcReg);
+    //sign bit test logic 
+    Register SignBitTest = Register(0);
+    Register NoSignTest = Register(0);
+    auto GetNegPosInstTest = [&](Register TestInst,
+                                 bool IsNegative) -> Register {
+      Register result = MRI->createVirtualRegister(GR.getRegClass(boolType));
+      if(!SignBitTest.isValid()){
+        SignBitTest = MRI->createVirtualRegister(GR.getRegClass(boolType));
+        MIRBuilder.buildInstr(SPIRV::OpSignBitSet)
+                  .addDef(SignBitTest)
+                  .addUse(GR.getSPIRVTypeID(boolType))
+                  .addUse(srcReg);
+      }
+
+      if (IsNegative) {
+        MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
+                  .addDef(result)
+                  .addUse(GR.getSPIRVTypeID(boolType))
+                  .addUse(SignBitTest)
+                  .addUse(TestInst);
+        return result;
+      }
+      if(!NoSignTest.isValid()){
+        NoSignTest = MRI->createVirtualRegister(GR.getRegClass(boolType));
+        MIRBuilder.buildInstr(SPIRV::OpLogicalNot)
+                  .addDef(NoSignTest)
+                  .addUse(GR.getSPIRVTypeID(boolType))
+                  .addUse(SignBitTest);
+      }
+
+      MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
+                .addDef(result)
+                .addUse(NoSignTest)
+                .addUse(TestInst);
+      return result;
     };
 
-    Register notSignCheck = NULL;
-    auto buildNotSignCheck = [&](){
-      notSignCheck = MRI->createVirtualRegister(MRI->getRegClass(srcReg));
-      buildSignCheck();
-      MIRBuilder.buildInstr(SPIRV::OpNot)
-                .addDef(notSignCheck)
-                .addUse(GR.getSPIRVTypeID(boolType))
-                .addUse(signTest);
-    };
-
-    Type *IntOpLLVMTy = IntegerType::getIntNTy(GR.CurMF->getFunction().getContext(),bitWidth);
     // if (srcLLVMType->isVectorTy())
     //   llvm::errs() << "is Vector Type" << "\n";
     //   IntOpLLVMTy = FixedVectorType::get(
@@ -3898,8 +3984,8 @@ bool SPIRVInstructionSelector::selectIsFpclass(Register ResVReg, const SPIRVType
     const llvm::fltSemantics &Semantics =srcLLVMType->getScalarType()->getFltSemantics();
     const APInt Inf = APFloat::getInf(Semantics).bitcastToAPInt();
     const APInt AllOneMantissa = APFloat::getLargest(Semantics).bitcastToAPInt() & ~Inf;
-    llvm::errs() << AllOneMantissa;
-    //some test cases can be inverted as simples test
+
+    //Mask Inversion Logic
     auto GetInvertedFPClassTest =
         [](const llvm::FPClassTest Test) -> llvm::FPClassTest {
       llvm::FPClassTest InvertedTest = ~Test & fcAllFlags;
@@ -3916,7 +4002,7 @@ bool SPIRVInstructionSelector::selectIsFpclass(Register ResVReg, const SPIRVType
       case fcPosNormal:
       case fcNegNormal:
       case fcSubnormal:
-      case fcPosSubnormal:
+      case fcPosSubnormal: 
       case fcNegSubnormal:
       case fcZero:
       case fcPosZero:
@@ -3937,258 +4023,102 @@ bool SPIRVInstructionSelector::selectIsFpclass(Register ResVReg, const SPIRVType
     }
 
     auto GetInvertedTestIfNeeded = [&](Register src){
+      if (!IsInverted)
+        return src;
       Register des = MRI->createVirtualRegister(MRI->getRegClass(src));
-      if (IsInverted)
-        MIRBuilder.buildInstr(SPIRV::OpNot).addDef(des).addUse(src);
+      MIRBuilder.buildInstr(SPIRV::OpLogicalNot).addDef(des).addUse(GR.getSPIRVTypeID(boolType)).addUse(src);
+      return des;
     };
-    
-    //checking for Nan
+
+    //checking for IsNan
     if (FPClass & fcNan) {
-      // Map on OpIsNan if we have both QNan and SNan test bits set
       if (FPClass & fcSNan && FPClass & fcQNan) {
-        MIRBuilder.buildInstr(SPIRV::OpIsNan)
-                  .addDef(ResVReg)
-                  .addUse(GR.getSPIRVTypeID(boolType))
-                  .addUse(srcReg);
-      
+        ResultVec.push_back(instructionTemplate(SPIRV::OpIsNan,boolType,boolType,"is_nan",srcReg)); 
       } else {
         // isquiet(V) ==> abs(V) >= (unsigned(Inf) | quiet_bit)
         APInt QNaNBitMask = APInt::getOneBitSet(bitWidth, AllOneMantissa.getActiveBits() - 1);
         APInt InfWithQnanBit = Inf | QNaNBitMask;
         int64_t InfWithQnanBitVal = InfWithQnanBit.getZExtValue();
-        SPIRVType* IntType = GR.getOrCreateSPIRVType(bitWidth, I, TII, SPIRV::OpTypeInt, IntOpLLVMTy);
-        Register constInfwithQuanBit = MRI->createVirtualRegister(GR.getRegClass(srcSPIRVType));
-        //converted the value into constant  
-        MIRBuilder.buildInstr(SPIRV::OpConstantI)
-          .addDef(constInfwithQuanBit)  
-          .addUse(GR.getSPIRVTypeID(IntType)) 
-          .addImm(InfWithQnanBitVal); 
-
-        //convert the floating point into Integer Type
-        Register constIntsrc = MRI->createVirtualRegister(GR.getRegClass(IntType));
-        MIRBuilder.buildInstr(SPIRV::OpBitcast)
-                  .addDef(constIntsrc)
-                  .addUse(GR.getSPIRVTypeID(IntType))
-                  .addUse(srcReg);
-
-        //now we have to compare two 
-        Register TestQnan = MRI->createVirtualRegister(GR.getRegClass(boolType));
-        Register DestReg = (FPClass & fcQNan) ? ResVReg : TestQnan;
-        MIRBuilder.buildInstr(SPIRV::OpUGreaterThanEqual)
-                  .addDef(DestReg)
-                  .addUse(GR.getSPIRVTypeID(boolType))
-                  .addUse(constIntsrc)
-                  .addUse(constInfwithQuanBit);
+        Register constInfwithQuanBit = instructionTemplate(SPIRV::OpConstantI, IntType, IntType,"Mask", InfWithQnanBitVal);
+        Register constIntsrc = instructionTemplate(SPIRV::OpBitcast, IntType, IntType,"int_Src", srcReg);
+        Register TestQnan = instructionTemplate(SPIRV::OpUGreaterThanEqual, boolType, boolType, "test_qnan", constIntsrc, constInfwithQuanBit);
         if(FPClass & fcSNan){
             //fcSNan = isNan && !isQNan
-            Register notQnan = MRI->createVirtualRegister(GR.getRegClass(IntType));
-            MIRBuilder.buildInstr(SPIRV::OpLogicalNot)
-                      .addDef(notQnan)
-                      .addUse(GR.getSPIRVTypeID(boolType))
-                      .addUse(DestReg);
-            Register IsNan = MRI->createVirtualRegister(GR.getRegClass(boolType));
-            MIRBuilder.buildInstr(SPIRV::OpIsNan)
-                      .addDef(IsNan)
-                      .addUse(GR.getSPIRVTypeID(boolType))
-                      .addUse(srcReg);
-
-            MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
-                      .addDef(ResVReg)
-                      .addUse(GR.getSPIRVTypeID(boolType))
-                      .addUse(IsNan)
-                      .addUse(notQnan);
+            Register notQnan = instructionTemplate(SPIRV::OpLogicalNot, boolType, boolType, "test_notqnan", TestQnan);
+            Register IsNan = instructionTemplate(SPIRV::OpIsNan, boolType, boolType, "is_nan", srcReg);
+            ResultVec.push_back(instructionTemplate(SPIRV::OpLogicalAnd, boolType, boolType, "Test_S_Nan", IsNan, notQnan));
+        }else{
+          ResultVec.push_back(TestQnan);
         }
       }
     }
+    //checking for isInf
     if (FPClass & fcInf) {
-      Register IsInf = MRI->createVirtualRegister(GR.getRegClass(boolType));
-      IsInf =  ((FPClass & fcPosInf) && (FPClass & fcNegInf)) ? ResVReg : IsInf;
-      MIRBuilder.buildInstr(SPIRV::OpIsInf)
-                      .addDef(IsInf)
-                      .addUse(GR.getSPIRVTypeID(boolType))
-                      .addUse(srcReg);
-
-      if((FPClass & fcPosInf)|| (FPClass & fcNegInf)){
-          llvm::errs() << "Handling Positive or Negative Infinity";
+      Register IsInf = instructionTemplate(SPIRV::OpIsInf, boolType, boolType, "is_inf", srcReg);
+      if(!((FPClass & fcPosInf)&&(FPClass & fcNegInf))){
+        ResultVec.push_back(GetNegPosInstTest(IsInf, FPClass & fcNegInf));
+      }else{
+        ResultVec.push_back(IsInf);
+      }
+    }
+    //for handling is Normal
+    if (FPClass & fcNormal) {
+      Register isNormal = instructionTemplate(SPIRV::OpIsNormal, boolType, boolType, "is_normal", srcReg);
+      if(!((FPClass & fcNegNormal)&&(FPClass & fcPosNormal))){
+        ResultVec.push_back(GetNegPosInstTest(isNormal, FPClass & fcNegNormal));
+      }else{
+        ResultVec.push_back(isNormal);
+      }
+    }
+    //for handling subnormal
+    if (FPClass & fcSubnormal) {
+      // issubnormal(V) ==> unsigned(abs(V) - 1) < (all mantissa bits set)
+      int64_t AllOneMantissa_int = AllOneMantissa.getZExtValue();
+      Register bitCastedsrc = instructionTemplate(SPIRV::OpBitcast, IntType, IntType,"int_Src", srcReg);            
+      Register constAllOneMantisa = instructionTemplate(SPIRV::OpConstantI, IntType, IntType,"all_one_mantisa", AllOneMantissa_int);    
+      Register bitCastedsrcMinusOne = instructionTemplate(SPIRV::OpISubS, IntType, IntType,"Threshold", bitCastedsrc, constAllOneMantisa);
+      Register testIsSubNormal = instructionTemplate(SPIRV::OpULessThan, boolType, boolType,"is_subNormal", bitCastedsrcMinusOne, constAllOneMantisa);
+      if(!((FPClass & fcNegSubnormal)&&(FPClass & fcPosSubnormal))){
+        ResultVec.push_back(GetNegPosInstTest(testIsSubNormal, FPClass & fcNegSubnormal));
+      }else{
+        ResultVec.push_back(testIsSubNormal);
       }
     }
 
-    // const MachineOperand &MaskOp = I.getOperand(2);
+    //check if the number is Zero
+    if(FPClass & fcZero){
+      auto SetUpCMPToZero = [&](Register BitCastToInt,
+                                bool IsPositive) -> Register {
+        APInt ZeroInt = APInt::getZero(bitWidth);
+        if (!IsPositive) {
+          ZeroInt.setSignBit();
+        }
+        int64_t zeroInt = ZeroInt.getZExtValue();
+        Register isEqual = instructionTemplate(SPIRV::OpIEqual, boolType, boolType, "is_equal", zeroInt, BitCastToInt);
+        return isEqual; 
+      };
 
-    // if (!MaskOp.isImm()) {
-    //     report_fatal_error("G_IS_FPCLASS requires immediate mask operand");
-    //     return false;
-    // }
-
-    // const uint32_t Mask = MaskOp.getImm();
-    // const SPIRVType *BoolTy = GR.getSPIRVTypeForVReg(ResVReg);
-    // if (!BoolTy) return false;
-
-
-    //------------------------------------------------//
-    // Register checkReg = Register();
-    // auto buildInstuction = [&](unsigned opcode){
-    //     checkReg = MRI->createVirtualRegister(MRI->getRegClass(ResVReg));
-    //     MIRBuilder.buildInstr(opcode)
-    //               .addDef(ResVReg)
-    //               .addUse(GR.getSPIRVTypeID(BoolTy))
-    //               .addUse(srcReg);
-    // };
-
-    // auto buildStore = [&](unsigned opcode, Register src, Register des){
-    //     MIRBuilder.buildInstr(opcode)
-    //               .addUse(src)
-    //               .addUse(des);
-    // };
-    //--------------------------------------------------//
-
-
-
-
-    // switch(Mask) {
-    //   case 0:  
-    //   case 1: { 
-    //     buildInstuction(SPIRV::OpIsNan);
-    //     fcFinite
-    //   }
-
-      // case 2: { 
-      //   Register isInf = MRI->createVirtualRegister(MRI->getRegClass(ResVReg));
-      //   MIRBuilder.buildInstr(SPIRV::OpIsInf)
-      //       .addDef(isInf)
-      //       .addUse(GR.getSPIRVTypeID(BoolTy))
-      //       .addUse(srcReg);
-
-      //   Register isNegative = MRI->createVirtualRegister(MRI->getRegClass(srcReg)); 
-      //   MIRBuilder.buildInstr(SPIRV::OpSignBitSet) 
-      //       .addDef(isNegative)
-      //       .addUse(GR.getSPIRVTypeID(BoolTy))
-      //       .addUse(srcReg);
-
-      //   MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
-      //       .addDef(CheckReg)
-      //       .addUse(isInf)  
-      //       .addUse(isNegative);
-      //   break;
-      // }
-
-      // case 3: { 
-      //   Register isNormal = MRI->createVirtualRegister(MRI->getRegClass(ResVReg));
-      //   MIRBuilder.buildInstr(SPIRV::OpIsNormal)
-      //       .addDef(isNormal)
-      //       .addUse(GR.getSPIRVTypeID(BoolTy))
-      //       .addUse(srcReg);
-
-      //   Register isNegative = MRI->createVirtualRegister(MRI->getRegClass(srcReg));
-      //   MIRBuilder.buildInstr(SPIRV::OpSignBitSet)  
-      //       .addDef(isNegative)
-      //       .addUse(GR.getSPIRVTypeID(BoolTy))
-      //       .addUse(srcReg);
-
-      //   MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
-      //       .addDef(CheckReg)
-      //       .addUse(isNormal) 
-      //       .addUse(isNegative); 
-      //   break;
-      // }
-
-    // case 4: {  // Negative subnormal
-    //     Register AbsReg = MRI.createVirtualRegister(FloatTy);
-    //     MIRBuilder.buildInstr(SPIRV::OpFAbs).addDef(AbsReg).addUse(srcReg);
-
-    //     APFloat MinNorm = APFloat::getSmallestNormalized(GR.getFloatSemantics(srcReg));
-    //     Register MinNormReg = buildConstantFP(MIRBuilder, srcReg, MinNorm);
-        
-    //     MIRBuilder.buildInstr(SPIRV::OpFOrdLessThan)
-    //         .addDef(CheckReg)
-    //         .addUse(AbsReg)
-    //         .addUse(MinNormReg);
-
-    //     Register IsNeg = MRI.createVirtualRegister(BoolTy);
-    //     Register Zero = buildConstantFPZero(MIRBuilder, srcReg);
-    //     MIRBuilder.buildInstr(SPIRV::OpFOrdLessThan)
-    //         .addDef(IsNeg)
-    //         .addUse(srcReg)
-    //         .addUse(Zero);
-
-    //     MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
-    //         .addDef(CheckReg)
-    //         .addUse(CheckReg)
-    //         .addUse(IsNeg);
-    //     break;
-    // }
-
-    // case 5:  
-    //     buildFCmp(SPIRV::OpFOrdEqual, -0.0f);
-    //     break;
-
-    // case 6: 
-    //     buildFCmp(SPIRV::OpFOrdEqual, 0.0f);
-    //     break;
-
-    // case 7: {  
-    //     Register AbsReg = MRI.createVirtualRegister(FloatTy);
-    //     MIRBuilder.buildInstr(SPIRV::OpFAbs).addDef(AbsReg).addUse(srcReg);
-
-    //     APFloat MinNorm = APFloat::getSmallestNormalized(GR.getFloatSemantics(srcReg));
-    //     Register MinNormReg = buildConstantFP(MIRBuilder, srcReg, MinNorm);
-        
-    //     MIRBuilder.buildInstr(SPIRV::OpFOrdLessThan)
-    //         .addDef(CheckReg)
-    //         .addUse(AbsReg)
-    //         .addUse(MinNormReg);
-
-    //     Register IsPos = MRI.createVirtualRegister(BoolTy);
-    //     Register Zero = buildZerosValF()
-    //     MIRBuilder.buildInstr(SPIRV::OpFOrdGreaterThan)
-    //         .addDef(IsPos)
-    //         .addUse(srcReg)
-    //         .addUse(Zero);
-
-    //     MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
-    //         .addDef(CheckReg)
-    //         .addUse(CheckReg)
-    //         .addUse(IsPos);
-    //     break;
-    // }
-
-    // case 8: { 
-    //     Register IsNormal = MRI->createVirtualRegister(MRI->getRegClass(ResVReg));
-    //     MIRBuilder.buildInstr(SPIRV::OpIsNormal)
-    //         .addDef(IsNormal)
-    //         .addUse(GR.getSPIRVTypeID(BoolTy))
-    //         .addUse(srcReg);
-
-    //     Register IsNegative = MRI->createVirtualRegister(MRI->getRegClass(srcReg));
-    //     Register Zero = buildZerosValF(GR.getOrCreateSPIRVFloatType(32, I, TII), I);
-    //     MIRBuilder.buildInstr(SPIRV::OpFOrdLessThan)
-    //         .addDef(CheckReg) 
-    //         .addUse(srcReg)    
-    //         .addUse(Zero);    
-
-    //     MIRBuilder.buildInstr(SPIRV::OpFOrdGreaterThan)
-    //         .addDef(IsNegative)
-    //         .addUse(srcReg)
-    //         .addUse(Zero);
-    //     MIRBuilder.buildInstr(SPIRV::OpLogicalAnd)
-    //         .addDef(CheckReg)
-    //         .addUse(IsNormal)
-    //         .addUse(IsNegative);
-    //     break;
-    // }
-
-    // case 9:  // Positive infinity
-    //     buildFCmp(SPIRV::OpFOrdEqual, INFINITY);
-    //     break;
-
-    // default:
-    //     report_fatal_error("Invalid fpclass mask value");
-    //     return false;
-    // 
-    // }
-
-    // MIRBuilder.buildCopy(ResVReg, CheckReg);
-    // I.eraseFromParent();
+      Register bitCastedsrc = instructionTemplate(SPIRV::OpBitcast, IntType, IntType , "int_src", srcReg);
+      if (FPClass & fcPosZero && FPClass & fcNegZero) {
+        APInt ZeroInt = APInt::getZero(bitWidth);
+        APInt MaskToClearSignBit = APInt::getSignedMaxValue(bitWidth);
+        Register MaskToClearSignBitConst = instructionTemplate(SPIRV::OpConstantI, IntType, IntType , "mask_clear_Sign", MaskToClearSignBit.getZExtValue());
+        Register zeroConst = instructionTemplate(SPIRV::OpConstantI, IntType, IntType , "zero_const", ZeroInt.getZExtValue());
+        Register bitwiseAndRes = instructionTemplate(SPIRV::OpBitwiseAndS, IntType, IntType , "bitwise_res", MaskToClearSignBitConst, bitCastedsrc);
+        ResultVec.push_back((SPIRV::OpIEqual, boolType, boolType, "is_zero", bitwiseAndRes, zeroConst));
+      }else if (FPClass & fcPosZero) {
+        ResultVec.push_back(SetUpCMPToZero(bitCastedsrc, true));
+      } else {
+        ResultVec.push_back(SetUpCMPToZero(bitCastedsrc, false));
+      }   
+    }
+    Register Result;
+    if(ResultVec.size() > 1){
+      for (size_t I = 0; I < ResultVec.size()-1; I++) {
+        Result = instructionTemplate(SPIRV::OpLogicalOr, boolType, boolType , "Intermediate_Result", ResultVec[I], ResultVec[I+1]);
+      }
+    }
+    MIRBuilder.buildCopy(ResVReg, Result);
   return true;
 }
 
